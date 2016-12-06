@@ -148,6 +148,9 @@ func (t *transferWriter) shouldSendContentLength() bool {
 		return true
 	}
 	if t.ContentLength == 0 && isIdentity(t.TransferEncoding) {
+		if t.Method == "GET" || t.Method == "HEAD" {
+			return false
+		}
 		return true
 	}
 
@@ -268,6 +271,10 @@ type transferReader struct {
 	Trailer          Header
 }
 
+func (t *transferReader) protoAtLeast(m, n int) bool {
+	return t.ProtoMajor > m || (t.ProtoMajor == m && t.ProtoMinor >= n)
+}
+
 // bodyAllowedForStatus reports whether a given response status code
 // permits a body.  See RFC2616, section 4.4.
 func bodyAllowedForStatus(status int) bool {
@@ -317,6 +324,7 @@ func readTransfer(msg interface{}, r *bufio.Reader) (err error) {
 		}
 	case *Request:
 		t.Header = rr.Header
+		t.RequestMethod = rr.Method
 		t.ProtoMajor = rr.ProtoMajor
 		t.ProtoMinor = rr.ProtoMinor
 		// Transfer semantics for Requests are exactly like those for
@@ -333,7 +341,7 @@ func readTransfer(msg interface{}, r *bufio.Reader) (err error) {
 	}
 
 	// Transfer encoding, content length
-	t.TransferEncoding, err = fixTransferEncoding(t.RequestMethod, t.Header)
+	err = t.fixTransferEncoding()
 	if err != nil {
 		return err
 	}
@@ -420,14 +428,18 @@ func chunked(te []string) bool { return len(te) > 0 && te[0] == "chunked" }
 // Checks whether the encoding is explicitly "identity".
 func isIdentity(te []string) bool { return len(te) == 1 && te[0] == "identity" }
 
-// Sanitize transfer encoding
-func fixTransferEncoding(requestMethod string, header Header) ([]string, error) {
-	raw, present := header["Transfer-Encoding"]
+// fixTransferEncoding sanitizes t.TransferEncoding, if needed.
+func (t *transferReader) fixTransferEncoding() error {
+	raw, present := t.Header["Transfer-Encoding"]
 	if !present {
-		return nil, nil
+		return nil
 	}
+	delete(t.Header, "Transfer-Encoding")
 
-	delete(header, "Transfer-Encoding")
+	// Issue 12785; ignore Transfer-Encoding on HTTP/1.0 requests.
+	if !t.protoAtLeast(1, 1) {
+		return nil
+	}
 
 	encodings := strings.Split(raw[0], ",")
 	te := make([]string, 0, len(encodings))
@@ -442,32 +454,54 @@ func fixTransferEncoding(requestMethod string, header Header) ([]string, error) 
 			break
 		}
 		if encoding != "chunked" {
-			return nil, &badStringError{"unsupported transfer encoding", encoding}
+			return &badStringError{"unsupported transfer encoding", encoding}
 		}
 		te = te[0 : len(te)+1]
 		te[len(te)-1] = encoding
 	}
 	if len(te) > 1 {
-		return nil, &badStringError{"too many transfer encodings", strings.Join(te, ",")}
+		return &badStringError{"too many transfer encodings", strings.Join(te, ",")}
 	}
 	if len(te) > 0 {
-		// Chunked encoding trumps Content-Length. See RFC 2616
-		// Section 4.4. Currently len(te) > 0 implies chunked
-		// encoding.
-		delete(header, "Content-Length")
-		return te, nil
+		// RFC 7230 3.3.2 says "A sender MUST NOT send a
+		// Content-Length header field in any message that
+		// contains a Transfer-Encoding header field."
+		//
+		// but also:
+		// "If a message is received with both a
+		// Transfer-Encoding and a Content-Length header
+		// field, the Transfer-Encoding overrides the
+		// Content-Length. Such a message might indicate an
+		// attempt to perform request smuggling (Section 9.5)
+		// or response splitting (Section 9.4) and ought to be
+		// handled as an error. A sender MUST remove the
+		// received Content-Length field prior to forwarding
+		// such a message downstream."
+		//
+		// Reportedly, these appear in the wild.
+		delete(t.Header, "Content-Length")
+		t.TransferEncoding = te
+		return nil
 	}
 
-	return nil, nil
+	return nil
 }
 
 // Determine the expected body length, using RFC 2616 Section 4.4. This
 // function is not a method, because ultimately it should be shared by
 // ReadResponse and ReadRequest.
 func fixLength(isResponse bool, status int, requestMethod string, header Header, te []string) (int64, error) {
-
+	contentLens := header["Content-Length"]
+	isRequest := !isResponse
 	// Logic based on response type or status
 	if noBodyExpected(requestMethod) {
+		// For HTTP requests, as part of hardening against request
+		// smuggling (RFC 7230), don't allow a Content-Length header for
+		// methods which don't permit bodies. As an exception, allow
+		// exactly one Content-Length header if its value is "0".
+		if isRequest && len(contentLens) > 0 && !(len(contentLens) == 1 && contentLens[0] == "0") {
+			return 0, fmt.Errorf("http: method cannot contain a Content-Length; got %q", contentLens)
+		}
 		return 0, nil
 	}
 	if status/100 == 1 {
@@ -478,13 +512,21 @@ func fixLength(isResponse bool, status int, requestMethod string, header Header,
 		return 0, nil
 	}
 
+	if len(contentLens) > 1 {
+		// harden against HTTP request smuggling. See RFC 7230.
+		return 0, errors.New("http: message cannot contain multiple Content-Length headers")
+	}
+
 	// Logic based on Transfer-Encoding
 	if chunked(te) {
 		return -1, nil
 	}
 
 	// Logic based on Content-Length
-	cl := strings.TrimSpace(header.get("Content-Length"))
+	var cl string
+	if len(contentLens) == 1 {
+		cl = strings.TrimSpace(contentLens[0])
+	}
 	if cl != "" {
 		n, err := parseContentLength(cl)
 		if err != nil {
@@ -495,11 +537,14 @@ func fixLength(isResponse bool, status int, requestMethod string, header Header,
 		header.Del("Content-Length")
 	}
 
-	if !isResponse && requestMethod == "GET" {
-		// RFC 2616 doesn't explicitly permit nor forbid an
+	if !isResponse {
+		// RFC 2616 neither explicitly permits nor forbids an
 		// entity-body on a GET request so we permit one if
 		// declared, but we default to 0 here (not -1 below)
 		// if there's no mention of a body.
+		// Likewise, all other request methods are assumed to have
+		// no body if neither Transfer-Encoding chunked nor a
+		// Content-Length are set.
 		return 0, nil
 	}
 
@@ -602,6 +647,12 @@ func (b *body) readLocked(p []byte) (n int, err error) {
 		if b.hdr != nil {
 			if e := b.readTrailer(); e != nil {
 				err = e
+				// Something went wrong in the trailer, we must not allow any
+				// further reads of any kind to succeed from body, nor any
+				// subsequent requests on the server connection. See
+				// golang.org/issue/12027
+				b.sawEOF = false
+				b.closed = true
 			}
 			b.hdr = nil
 		} else {
@@ -700,6 +751,16 @@ func mergeSetHeader(dst *Header, src Header) {
 	for k, vv := range src {
 		(*dst)[k] = vv
 	}
+}
+
+// unreadDataSizeLocked returns the number of bytes of unread input.
+// It returns -1 if unknown.
+// b.mu must be held.
+func (b *body) unreadDataSizeLocked() int64 {
+	if lr, ok := b.src.(*io.LimitedReader); ok {
+		return lr.N
+	}
+	return -1
 }
 
 func (b *body) Close() error {

@@ -6,6 +6,8 @@ package url
 
 import (
 	"fmt"
+	"io"
+	"net"
 	"reflect"
 	"strings"
 	"testing"
@@ -99,7 +101,6 @@ var urltests = []URLTest{
 			Scheme:   "http",
 			Host:     "www.google.com",
 			Path:     "/a b",
-			RawPath:  "/a%20b",
 			RawQuery: "q=c+d",
 		},
 		"",
@@ -383,6 +384,48 @@ var urltests = []URLTest{
 		},
 		"",
 	},
+	// issue 12036
+	{
+		"mysql://a,b,c/bar",
+		&URL{
+			Scheme: "mysql",
+			Host:   "a,b,c",
+			Path:   "/bar",
+		},
+		"",
+	},
+	// worst case host, still round trips
+	{
+		"scheme://!$&'()*+,;=hello!:port/path",
+		&URL{
+			Scheme: "scheme",
+			Host:   "!$&'()*+,;=hello!:port",
+			Path:   "/path",
+		},
+		"",
+	},
+	// worst case path, still round trips
+	{
+		"http://host/!$&'()*+,;=:@[hello]",
+		&URL{
+			Scheme:  "http",
+			Host:    "host",
+			Path:    "/!$&'()*+,;=:@[hello]",
+			RawPath: "/!$&'()*+,;=:@[hello]",
+		},
+		"",
+	},
+	// golang.org/issue/5684
+	{
+		"http://example.com/oid/[order_id]",
+		&URL{
+			Scheme:  "http",
+			Host:    "example.com",
+			Path:    "/oid/[order_id]",
+			RawPath: "/oid/[order_id]",
+		},
+		"",
+	},
 }
 
 // more useful string for debugging than fmt's struct printer
@@ -394,8 +437,8 @@ func ufmt(u *URL) string {
 			pass = p
 		}
 	}
-	return fmt.Sprintf("opaque=%q, scheme=%q, user=%#v, pass=%#v, host=%q, path=%q, rawq=%q, frag=%q",
-		u.Opaque, u.Scheme, user, pass, u.Host, u.Path, u.RawQuery, u.Fragment)
+	return fmt.Sprintf("opaque=%q, scheme=%q, user=%#v, pass=%#v, host=%q, path=%q, rawpath=%q, rawq=%q, frag=%q",
+		u.Opaque, u.Scheme, user, pass, u.Host, u.Path, u.RawPath, u.RawQuery, u.Fragment)
 }
 
 func DoTest(t *testing.T, parse func(string) (*URL, error), name string, tests []URLTest) {
@@ -404,9 +447,6 @@ func DoTest(t *testing.T, parse func(string) (*URL, error), name string, tests [
 		if err != nil {
 			t.Errorf("%s(%q) returned error %s", name, tt.in, err)
 			continue
-		}
-		if tt.out.RawPath == "" {
-			tt.out.RawPath = tt.out.Path
 		}
 		if !reflect.DeepEqual(u, tt.out) {
 			t.Errorf("%s(%q):\n\thave %v\n\twant %v\n",
@@ -1085,13 +1125,17 @@ func TestParseAuthority(t *testing.T) {
 		{"http://[::1]/", false},
 		{"http://[::1]a", true},
 		{"http://[::1]%23", true},
-		{"http://[::1%25en0]", false}, // valid zone id
-		{"http://[::1]:", true},       // colon, but no port
-		{"http://[::1]:%38%30", true}, // no hex in port
-		{"http://[::1%25%10]", false}, // TODO: reject the %10 after the valid zone %25 separator?
-		{"http://[%10::1]", true},     // no %xx escapes in IP address
-		{"http://[::1]/%48", false},   // %xx in path is fine
-		{"http://%41:8080/", true},    // TODO: arguably we should accept reg-name with %xx
+		{"http://[::1%25en0]", false},     // valid zone id
+		{"http://[::1]:", true},           // colon, but no port
+		{"http://[::1]:%38%30", true},     // no hex in port
+		{"http://[::1%25%10]", false},     // TODO: reject the %10 after the valid zone %25 separator?
+		{"http://[%10::1]", true},         // no %xx escapes in IP address
+		{"http://[::1]/%48", false},       // %xx in path is fine
+		{"http://%41:8080/", true},        // TODO: arguably we should accept reg-name with %xx
+		{"mysql://x@y(z:123)/foo", false}, // golang.org/issue/12023
+		{"mysql://x@y(1.2.3.4:123)/foo", false},
+		{"mysql://x@y([2001:db8::1]:123)/foo", false},
+		{"http://[]%20%48%54%54%50%2f%31%2e%31%0a%4d%79%48%65%61%64%65%72%3a%20%31%32%33%0a%0a/", true}, // golang.org/issue/11208
 	}
 	for _, tt := range tests {
 		u, err := Parse(tt.in)
@@ -1130,6 +1174,7 @@ var shouldEscapeTests = []shouldEscapeTest{
 	{'a', encodeUserPassword, false},
 	{'a', encodeQueryComponent, false},
 	{'a', encodeFragment, false},
+	{'a', encodeHost, false},
 	{'z', encodePath, false},
 	{'A', encodePath, false},
 	{'Z', encodePath, false},
@@ -1154,12 +1199,116 @@ var shouldEscapeTests = []shouldEscapeTest{
 	{',', encodeUserPassword, false},
 	{';', encodeUserPassword, false},
 	{'=', encodeUserPassword, false},
+
+	// Host (IP address, IPv6 address, registered name, port suffix; §3.2.2)
+	{'!', encodeHost, false},
+	{'$', encodeHost, false},
+	{'&', encodeHost, false},
+	{'\'', encodeHost, false},
+	{'(', encodeHost, false},
+	{')', encodeHost, false},
+	{'*', encodeHost, false},
+	{'+', encodeHost, false},
+	{',', encodeHost, false},
+	{';', encodeHost, false},
+	{'=', encodeHost, false},
+	{':', encodeHost, false},
+	{'[', encodeHost, false},
+	{']', encodeHost, false},
+	{'0', encodeHost, false},
+	{'9', encodeHost, false},
+	{'A', encodeHost, false},
+	{'z', encodeHost, false},
+	{'_', encodeHost, false},
+	{'-', encodeHost, false},
+	{'.', encodeHost, false},
 }
 
 func TestShouldEscape(t *testing.T) {
 	for _, tt := range shouldEscapeTests {
 		if shouldEscape(tt.in, tt.mode) != tt.escape {
 			t.Errorf("shouldEscape(%q, %v) returned %v; expected %v", tt.in, tt.mode, !tt.escape, tt.escape)
+		}
+	}
+}
+
+type timeoutError struct {
+	timeout bool
+}
+
+func (e *timeoutError) Error() string { return "timeout error" }
+func (e *timeoutError) Timeout() bool { return e.timeout }
+
+type temporaryError struct {
+	temporary bool
+}
+
+func (e *temporaryError) Error() string   { return "temporary error" }
+func (e *temporaryError) Temporary() bool { return e.temporary }
+
+type timeoutTemporaryError struct {
+	timeoutError
+	temporaryError
+}
+
+func (e *timeoutTemporaryError) Error() string { return "timeout/temporary error" }
+
+var netErrorTests = []struct {
+	err       error
+	timeout   bool
+	temporary bool
+}{{
+	err:       &Error{"Get", "http://google.com/", &timeoutError{timeout: true}},
+	timeout:   true,
+	temporary: false,
+}, {
+	err:       &Error{"Get", "http://google.com/", &timeoutError{timeout: false}},
+	timeout:   false,
+	temporary: false,
+}, {
+	err:       &Error{"Get", "http://google.com/", &temporaryError{temporary: true}},
+	timeout:   false,
+	temporary: true,
+}, {
+	err:       &Error{"Get", "http://google.com/", &temporaryError{temporary: false}},
+	timeout:   false,
+	temporary: false,
+}, {
+	err:       &Error{"Get", "http://google.com/", &timeoutTemporaryError{timeoutError{timeout: true}, temporaryError{temporary: true}}},
+	timeout:   true,
+	temporary: true,
+}, {
+	err:       &Error{"Get", "http://google.com/", &timeoutTemporaryError{timeoutError{timeout: false}, temporaryError{temporary: true}}},
+	timeout:   false,
+	temporary: true,
+}, {
+	err:       &Error{"Get", "http://google.com/", &timeoutTemporaryError{timeoutError{timeout: true}, temporaryError{temporary: false}}},
+	timeout:   true,
+	temporary: false,
+}, {
+	err:       &Error{"Get", "http://google.com/", &timeoutTemporaryError{timeoutError{timeout: false}, temporaryError{temporary: false}}},
+	timeout:   false,
+	temporary: false,
+}, {
+	err:       &Error{"Get", "http://google.com/", io.EOF},
+	timeout:   false,
+	temporary: false,
+}}
+
+// Test that url.Error implements net.Error and that it forwards
+func TestURLErrorImplementsNetError(t *testing.T) {
+	for i, tt := range netErrorTests {
+		err, ok := tt.err.(net.Error)
+		if !ok {
+			t.Errorf("%d: %T does not implement net.Error", i+1, tt.err)
+			continue
+		}
+		if err.Timeout() != tt.timeout {
+			t.Errorf("%d: err.Timeout(): want %v, have %v", i+1, tt.timeout, err.Timeout())
+			continue
+		}
+		if err.Temporary() != tt.temporary {
+			t.Errorf("%d: err.Temporary(): want %v, have %v", i+1, tt.temporary, err.Temporary())
 		}
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"io/ioutil"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"testing/iotest"
@@ -291,7 +292,7 @@ func TestPax(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Simple test to make sure PAX extensions are in effect
-	if !bytes.Contains(buf.Bytes(), []byte("PaxHeaders.")) {
+	if !bytes.Contains(buf.Bytes(), []byte("PaxHeaders.0")) {
 		t.Fatal("Expected at least one PAX header to be written.")
 	}
 	// Test that we can get a long name back out of the archive.
@@ -330,7 +331,7 @@ func TestPaxSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Simple test to make sure PAX extensions are in effect
-	if !bytes.Contains(buf.Bytes(), []byte("PaxHeaders.")) {
+	if !bytes.Contains(buf.Bytes(), []byte("PaxHeaders.0")) {
 		t.Fatal("Expected at least one PAX header to be written.")
 	}
 	// Test that we can get a long name back out of the archive.
@@ -380,7 +381,7 @@ func TestPaxNonAscii(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Simple test to make sure PAX extensions are in effect
-	if !bytes.Contains(buf.Bytes(), []byte("PaxHeaders.")) {
+	if !bytes.Contains(buf.Bytes(), []byte("PaxHeaders.0")) {
 		t.Fatal("Expected at least one PAX header to be written.")
 	}
 	// Test that we can get a long name back out of the archive.
@@ -439,21 +440,49 @@ func TestPaxXattrs(t *testing.T) {
 	}
 }
 
-func TestPAXHeader(t *testing.T) {
-	medName := strings.Repeat("CD", 50)
-	longName := strings.Repeat("AB", 100)
-	paxTests := [][2]string{
-		{paxPath + "=/etc/hosts", "19 path=/etc/hosts\n"},
-		{"a=b", "6 a=b\n"},          // Single digit length
-		{"a=names", "11 a=names\n"}, // Test case involving carries
-		{paxPath + "=" + longName, fmt.Sprintf("210 path=%s\n", longName)},
-		{paxPath + "=" + medName, fmt.Sprintf("110 path=%s\n", medName)}}
+func TestPaxHeadersSorted(t *testing.T) {
+	fileinfo, err := os.Stat("testdata/small.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr, err := FileInfoHeader(fileinfo, "")
+	if err != nil {
+		t.Fatalf("os.Stat: %v", err)
+	}
+	contents := strings.Repeat(" ", int(hdr.Size))
 
-	for _, test := range paxTests {
-		key, expected := test[0], test[1]
-		if result := paxHeader(key); result != expected {
-			t.Fatalf("paxHeader: got %s, expected %s", result, expected)
-		}
+	hdr.Xattrs = map[string]string{
+		"foo": "foo",
+		"bar": "bar",
+		"baz": "baz",
+		"qux": "qux",
+	}
+
+	var buf bytes.Buffer
+	writer := NewWriter(&buf)
+	if err := writer.WriteHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = writer.Write([]byte(contents)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// Simple test to make sure PAX extensions are in effect
+	if !bytes.Contains(buf.Bytes(), []byte("PaxHeaders.0")) {
+		t.Fatal("Expected at least one PAX header to be written.")
+	}
+
+	// xattr bar should always appear before others
+	indices := []int{
+		bytes.Index(buf.Bytes(), []byte("bar=bar")),
+		bytes.Index(buf.Bytes(), []byte("baz=baz")),
+		bytes.Index(buf.Bytes(), []byte("foo=foo")),
+		bytes.Index(buf.Bytes(), []byte("qux=qux")),
+	}
+	if !sort.IntsAreSorted(indices) {
+		t.Fatal("PAX headers are not sorted")
 	}
 }
 
@@ -542,5 +571,69 @@ func TestWriteAfterClose(t *testing.T) {
 	tw.Close()
 	if _, err := tw.Write([]byte("Kilts")); err != ErrWriteAfterClose {
 		t.Fatalf("Write: got %v; want ErrWriteAfterClose", err)
+	}
+}
+
+func TestSplitUSTARPath(t *testing.T) {
+	var sr = strings.Repeat
+
+	var vectors = []struct {
+		input  string // Input path
+		prefix string // Expected output prefix
+		suffix string // Expected output suffix
+		ok     bool   // Split success?
+	}{
+		{"", "", "", false},
+		{"abc", "", "", false},
+		{"用戶名", "", "", false},
+		{sr("a", fileNameSize), "", "", false},
+		{sr("a", fileNameSize) + "/", "", "", false},
+		{sr("a", fileNameSize) + "/a", sr("a", fileNameSize), "a", true},
+		{sr("a", fileNamePrefixSize) + "/", "", "", false},
+		{sr("a", fileNamePrefixSize) + "/a", sr("a", fileNamePrefixSize), "a", true},
+		{sr("a", fileNameSize+1), "", "", false},
+		{sr("/", fileNameSize+1), sr("/", fileNameSize-1), "/", true},
+		{sr("a", fileNamePrefixSize) + "/" + sr("b", fileNameSize),
+			sr("a", fileNamePrefixSize), sr("b", fileNameSize), true},
+		{sr("a", fileNamePrefixSize) + "//" + sr("b", fileNameSize), "", "", false},
+		{sr("a/", fileNameSize), sr("a/", 77) + "a", sr("a/", 22), true},
+	}
+
+	for _, v := range vectors {
+		prefix, suffix, ok := splitUSTARPath(v.input)
+		if prefix != v.prefix || suffix != v.suffix || ok != v.ok {
+			t.Errorf("splitUSTARPath(%q):\ngot  (%q, %q, %v)\nwant (%q, %q, %v)",
+				v.input, prefix, suffix, ok, v.prefix, v.suffix, v.ok)
+		}
+	}
+}
+
+func TestFormatPAXRecord(t *testing.T) {
+	var medName = strings.Repeat("CD", 50)
+	var longName = strings.Repeat("AB", 100)
+
+	var vectors = []struct {
+		inputKey string
+		inputVal string
+		output   string
+	}{
+		{"k", "v", "6 k=v\n"},
+		{"path", "/etc/hosts", "19 path=/etc/hosts\n"},
+		{"path", longName, "210 path=" + longName + "\n"},
+		{"path", medName, "110 path=" + medName + "\n"},
+		{"foo", "ba", "9 foo=ba\n"},
+		{"foo", "bar", "11 foo=bar\n"},
+		{"foo", "b=\nar=\n==\x00", "18 foo=b=\nar=\n==\x00\n"},
+		{"foo", "hello9 foo=ba\nworld", "27 foo=hello9 foo=ba\nworld\n"},
+		{"☺☻☹", "日a本b語ç", "27 ☺☻☹=日a本b語ç\n"},
+		{"\x00hello", "\x00world", "17 \x00hello=\x00world\n"},
+	}
+
+	for _, v := range vectors {
+		output := formatPAXRecord(v.inputKey, v.inputVal)
+		if output != v.output {
+			t.Errorf("formatPAXRecord(%q, %q): got %q, want %q",
+				v.inputKey, v.inputVal, output, v.output)
+		}
 	}
 }

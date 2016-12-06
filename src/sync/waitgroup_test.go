@@ -5,6 +5,7 @@
 package sync_test
 
 import (
+	"internal/race"
 	"runtime"
 	. "sync"
 	"sync/atomic"
@@ -48,7 +49,7 @@ func TestWaitGroup(t *testing.T) {
 }
 
 func knownRacy(t *testing.T) {
-	if RaceEnabled {
+	if race.Enabled {
 		t.Skip("skipping known-racy test under the race detector")
 	}
 }
@@ -69,6 +70,9 @@ func TestWaitGroupMisuse(t *testing.T) {
 
 func TestWaitGroupMisuse2(t *testing.T) {
 	knownRacy(t)
+	if testing.Short() {
+		t.Skip("skipping flaky test in short mode; see issue 11443")
+	}
 	if runtime.NumCPU() <= 2 {
 		t.Skip("NumCPU<=2, skipping: this test requires parallelism")
 	}

@@ -6,10 +6,10 @@
 // databases.
 //
 // The sql package must be used in conjunction with a database driver.
-// See http://golang.org/s/sqldrivers for a list of drivers.
+// See https://golang.org/s/sqldrivers for a list of drivers.
 //
 // For more usage examples, see the wiki page at
-// http://golang.org/s/sqlwiki.
+// https://golang.org/s/sqlwiki.
 package sql
 
 import (
@@ -23,12 +23,17 @@ import (
 	"sync/atomic"
 )
 
-var drivers = make(map[string]driver.Driver)
+var (
+	driversMu sync.RWMutex
+	drivers   = make(map[string]driver.Driver)
+)
 
 // Register makes a database driver available by the provided name.
 // If Register is called twice with the same name or if driver is nil,
 // it panics.
 func Register(name string, driver driver.Driver) {
+	driversMu.Lock()
+	defer driversMu.Unlock()
 	if driver == nil {
 		panic("sql: Register driver is nil")
 	}
@@ -39,12 +44,16 @@ func Register(name string, driver driver.Driver) {
 }
 
 func unregisterAllDrivers() {
+	driversMu.Lock()
+	defer driversMu.Unlock()
 	// For tests.
 	drivers = make(map[string]driver.Driver)
 }
 
 // Drivers returns a sorted list of the names of the registered drivers.
 func Drivers() []string {
+	driversMu.RLock()
+	defer driversMu.RUnlock()
 	var list []string
 	for name := range drivers {
 		list = append(list, name)
@@ -220,8 +229,7 @@ type DB struct {
 	mu           sync.Mutex // protects following fields
 	freeConn     []*driverConn
 	connRequests []chan connRequest
-	numOpen      int
-	pendingOpens int
+	numOpen      int // number of opened and pending open connections
 	// Used to signal the need for new connections
 	// a goroutine running connectionOpener() reads on this chan and
 	// maybeOpenNewConnections sends on the chan (one send per needed connection)
@@ -432,7 +440,7 @@ func (db *DB) removeDepLocked(x finalCloser, dep interface{}) func() error {
 	}
 }
 
-// This is the size of the connectionOpener request chan (dn.openerCh).
+// This is the size of the connectionOpener request chan (DB.openerCh).
 // This value should be larger than the maximum typical value
 // used for db.maxOpen. If maxOpen is significantly larger than
 // connectionRequestQueueSize then it is possible for ALL calls into the *DB
@@ -445,7 +453,7 @@ var connectionRequestQueueSize = 1000000
 //
 // Most users will open a database via a driver-specific connection
 // helper function that returns a *DB. No database drivers are included
-// in the Go standard library. See http://golang.org/s/sqldrivers for
+// in the Go standard library. See https://golang.org/s/sqldrivers for
 // a list of third-party drivers.
 //
 // Open may just validate its arguments without creating a connection
@@ -457,7 +465,9 @@ var connectionRequestQueueSize = 1000000
 // function should be called just once. It is rarely necessary to
 // close a DB.
 func Open(driverName, dataSourceName string) (*DB, error) {
+	driversMu.RLock()
 	driveri, ok := drivers[driverName]
+	driversMu.RUnlock()
 	if !ok {
 		return nil, fmt.Errorf("sql: unknown driver %q (forgotten import?)", driverName)
 	}
@@ -604,15 +614,15 @@ func (db *DB) Stats() DBStats {
 // If there are connRequests and the connection limit hasn't been reached,
 // then tell the connectionOpener to open new connections.
 func (db *DB) maybeOpenNewConnections() {
-	numRequests := len(db.connRequests) - db.pendingOpens
+	numRequests := len(db.connRequests)
 	if db.maxOpen > 0 {
-		numCanOpen := db.maxOpen - (db.numOpen + db.pendingOpens)
+		numCanOpen := db.maxOpen - db.numOpen
 		if numRequests > numCanOpen {
 			numRequests = numCanOpen
 		}
 	}
 	for numRequests > 0 {
-		db.pendingOpens++
+		db.numOpen++ // optimistically
 		numRequests--
 		db.openerCh <- struct{}{}
 	}
@@ -627,6 +637,9 @@ func (db *DB) connectionOpener() {
 
 // Open one new connection
 func (db *DB) openNewConnection() {
+	// maybeOpenNewConnctions has already executed db.numOpen++ before it sent
+	// on db.openerCh. This function must execute db.numOpen-- if the
+	// connection fails or is closed before returning.
 	ci, err := db.driver.Open(db.dsn)
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -634,11 +647,13 @@ func (db *DB) openNewConnection() {
 		if err == nil {
 			ci.Close()
 		}
+		db.numOpen--
 		return
 	}
-	db.pendingOpens--
 	if err != nil {
+		db.numOpen--
 		db.putConnDBLocked(nil, err)
+		db.maybeOpenNewConnections()
 		return
 	}
 	dc := &driverConn{
@@ -647,8 +662,8 @@ func (db *DB) openNewConnection() {
 	}
 	if db.putConnDBLocked(dc, err) {
 		db.addDepLocked(dc, dc)
-		db.numOpen++
 	} else {
+		db.numOpen--
 		ci.Close()
 	}
 }
@@ -690,7 +705,10 @@ func (db *DB) conn(strategy connReuseStrategy) (*driverConn, error) {
 		req := make(chan connRequest, 1)
 		db.connRequests = append(db.connRequests, req)
 		db.mu.Unlock()
-		ret := <-req
+		ret, ok := <-req
+		if !ok {
+			return nil, errDBClosed
+		}
 		return ret.conn, ret.err
 	}
 
@@ -700,6 +718,7 @@ func (db *DB) conn(strategy connReuseStrategy) (*driverConn, error) {
 	if err != nil {
 		db.mu.Lock()
 		db.numOpen-- // correct for earlier optimism
+		db.maybeOpenNewConnections()
 		db.mu.Unlock()
 		return nil, err
 	}
@@ -829,6 +848,8 @@ const maxBadConnRetries = 2
 // Prepare creates a prepared statement for later queries or executions.
 // Multiple queries or executions may be run concurrently from the
 // returned statement.
+// The caller must call the statement's Close method
+// when the statement is no longer needed.
 func (db *DB) Prepare(query string) (*Stmt, error) {
 	var stmt *Stmt
 	var err error
@@ -1063,6 +1084,10 @@ func (db *DB) Driver() driver.Driver {
 //
 // After a call to Commit or Rollback, all operations on the
 // transaction fail with ErrTxDone.
+//
+// The statements prepared for a transaction by calling
+// the transaction's Prepare or Stmt methods are closed
+// by the call to Commit or Rollback.
 type Tx struct {
 	db *DB
 
@@ -1086,12 +1111,12 @@ type Tx struct {
 
 var ErrTxDone = errors.New("sql: Transaction has already been committed or rolled back")
 
-func (tx *Tx) close() {
+func (tx *Tx) close(err error) {
 	if tx.done {
 		panic("double close") // internal error
 	}
 	tx.done = true
-	tx.db.putConn(tx.dc, nil)
+	tx.db.putConn(tx.dc, err)
 	tx.dc = nil
 	tx.txi = nil
 }
@@ -1117,13 +1142,13 @@ func (tx *Tx) Commit() error {
 	if tx.done {
 		return ErrTxDone
 	}
-	defer tx.close()
 	tx.dc.Lock()
 	err := tx.txi.Commit()
 	tx.dc.Unlock()
 	if err != driver.ErrBadConn {
 		tx.closePrepared()
 	}
+	tx.close(err)
 	return err
 }
 
@@ -1132,13 +1157,13 @@ func (tx *Tx) Rollback() error {
 	if tx.done {
 		return ErrTxDone
 	}
-	defer tx.close()
 	tx.dc.Lock()
 	err := tx.txi.Rollback()
 	tx.dc.Unlock()
 	if err != driver.ErrBadConn {
 		tx.closePrepared()
 	}
+	tx.close(err)
 	return err
 }
 
@@ -1198,6 +1223,9 @@ func (tx *Tx) Prepare(query string) (*Stmt, error) {
 //  tx, err := db.Begin()
 //  ...
 //  res, err := tx.Stmt(updateMoney).Exec(123.45, 98293203)
+//
+// The returned statement operates within the transaction and can no longer
+// be used once the transaction has been committed or rolled back.
 func (tx *Tx) Stmt(stmt *Stmt) *Stmt {
 	// TODO(bradfitz): optimize this. Currently this re-prepares
 	// each time.  This is fine for now to illustrate the API but
@@ -1289,7 +1317,8 @@ type connStmt struct {
 	si driver.Stmt
 }
 
-// Stmt is a prepared statement. Stmt is safe for concurrent use by multiple goroutines.
+// Stmt is a prepared statement.
+// A Stmt is safe for concurrent use by multiple goroutines.
 type Stmt struct {
 	// Immutable:
 	db        *DB    // where we came from
@@ -1555,9 +1584,9 @@ func (s *Stmt) Close() error {
 	s.closed = true
 
 	if s.tx != nil {
-		s.txsi.Close()
+		err := s.txsi.Close()
 		s.mu.Unlock()
-		return nil
+		return err
 	}
 	s.mu.Unlock()
 

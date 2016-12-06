@@ -222,7 +222,7 @@ func cgoLookupPTR(addr string) ([]string, error, bool) {
 			break
 		}
 	}
-	return []string{string(b)}, nil, true
+	return []string{absDomainName(b)}, nil, true
 }
 
 func cgoSockaddr(ip IP) (*C.struct_sockaddr, C.socklen_t) {

@@ -125,8 +125,21 @@ func SetPendingDialHooks(before, after func()) {
 	prePendingDial, postPendingDial = before, after
 }
 
+// SetRetriedHook sets the hook that runs when an idempotent retry occurs.
+func SetRetriedHook(hook func()) {
+	retried = hook
+}
+
 var ExportServerNewConn = (*Server).newConn
 
 var ExportCloseWriteAndWait = (*conn).closeWriteAndWait
 
 var ExportErrRequestCanceled = errRequestCanceled
+
+var ExportServeFile = serveFile
+
+var ExportHttp2ConfigureTransport = http2ConfigureTransport
+
+var ExportHttp2ConfigureServer = http2ConfigureServer
+
+func SetTestHookServerServe(fn func(*Server, net.Listener)) { testHookServerServe = fn }

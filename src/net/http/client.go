@@ -10,6 +10,7 @@
 package http
 
 import (
+	"crypto/tls"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -222,6 +223,14 @@ func send(req *Request, t RoundTripper) (resp *Response, err error) {
 		if resp != nil {
 			log.Printf("RoundTripper returned a response & error; ignoring response")
 		}
+		if tlsErr, ok := err.(tls.RecordHeaderError); ok {
+			// If we get a bad TLS record header, check to see if the
+			// response looks like HTTP and give a more helpful error.
+			// See golang.org/issue/11111.
+			if string(tlsErr.RecordHeader[:]) == "HTTP/" {
+				err = errors.New("http: server gave HTTP response to HTTPS client")
+			}
+		}
 		return nil, err
 	}
 	return resp, nil
@@ -423,7 +432,7 @@ func (c *Client) doFollowingRedirects(ireq *Request, shouldRedirect func(int) bo
 	if redirectFailed {
 		// Special case for Go 1 compatibility: return both the response
 		// and an error if the CheckRedirect function failed.
-		// See http://golang.org/issue/3795
+		// See https://golang.org/issue/3795
 		return resp, urlErr
 	}
 

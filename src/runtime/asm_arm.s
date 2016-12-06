@@ -31,7 +31,8 @@ TEXT runtime·rt0_go(SB),NOSPLIT,$-4
 	MOVW	R8, g_m(g)
 
 	// create istack out of the OS stack
-	MOVW	$(-8192+104)(R13), R0
+	// (1MB of system stack is available on iOS and Android)
+	MOVW	$(-64*1024+104)(R13), R0
 	MOVW	R0, g_stackguard0(g)
 	MOVW	R0, g_stackguard1(g)
 	MOVW	R0, (g_stack+stack_lo)(g)
@@ -215,6 +216,9 @@ switch:
 	// save our state in g->sched.  Pretend to
 	// be systemstack_switch if the G stack is scanned.
 	MOVW	$runtime·systemstack_switch(SB), R3
+#ifdef GOOS_nacl
+	ADD	$4, R3, R3 // get past nacl-insert bic instruction
+#endif
 	ADD	$4, R3, R3 // get past push {lr}
 	MOVW	R3, (g_sched+gobuf_pc)(g)
 	MOVW	R13, (g_sched+gobuf_sp)(g)
@@ -691,52 +695,9 @@ TEXT runtime·abort(SB),NOSPLIT,$-4-0
 	MOVW	$0, R0
 	MOVW	(R0), R1
 
-// bool armcas(int32 *val, int32 old, int32 new)
-// Atomically:
-//	if(*val == old){
-//		*val = new;
-//		return 1;
-//	}else
-//		return 0;
-//
-// To implement runtime·cas in sys_$GOOS_arm.s
-// using the native instructions, use:
-//
-//	TEXT runtime·cas(SB),NOSPLIT,$0
-//		B	runtime·armcas(SB)
-//
-TEXT runtime·armcas(SB),NOSPLIT,$0-13
-	MOVW	valptr+0(FP), R1
-	MOVW	old+4(FP), R2
-	MOVW	new+8(FP), R3
-casl:
-	LDREX	(R1), R0
-	CMP	R0, R2
-	BNE	casfail
-	STREX	R3, (R1), R0
-	CMP	$0, R0
-	BNE	casl
-	MOVW	$1, R0
-	MOVB	R0, ret+12(FP)
-	RET
-casfail:
-	MOVW	$0, R0
-	MOVB	R0, ret+12(FP)
-	RET
-
-TEXT runtime·casuintptr(SB),NOSPLIT,$0-13
-	B	runtime·cas(SB)
-
-TEXT runtime·atomicloaduintptr(SB),NOSPLIT,$0-8
-	B	runtime·atomicload(SB)
-
-TEXT runtime·atomicloaduint(SB),NOSPLIT,$0-8
-	B	runtime·atomicload(SB)
-
-TEXT runtime·atomicstoreuintptr(SB),NOSPLIT,$0-8
-	B	runtime·atomicstore(SB)
-
 // armPublicationBarrier is a native store/store barrier for ARMv7+.
+// On earlier ARM revisions, armPublicationBarrier is a no-op.
+// This will not work on SMP ARMv6 machines, if any are in use.
 // To implement publiationBarrier in sys_$GOOS_arm.s using the native
 // instructions, use:
 //
@@ -744,6 +705,9 @@ TEXT runtime·atomicstoreuintptr(SB),NOSPLIT,$0-8
 //		B	runtime·armPublicationBarrier(SB)
 //
 TEXT runtime·armPublicationBarrier(SB),NOSPLIT,$-4-0
+	MOVB	runtime·goarm(SB), R11
+	CMP	$7, R11
+	BLT	2(PC)
 	WORD $0xf57ff05e	// DMB ST
 	RET
 
@@ -842,6 +806,8 @@ TEXT bytes·Compare(SB),NOSPLIT,$-4-28
 // On exit:
 // R4, R5, and R6 are clobbered
 TEXT runtime·cmpbody(SB),NOSPLIT,$-4-0
+	CMP	R2, R3
+	BEQ	samebytes
 	CMP 	R0, R1
 	MOVW 	R0, R6
 	MOVW.LT	R1, R6	// R6 is min(R0, R1)
@@ -1028,4 +994,44 @@ TEXT runtime·prefetcht2(SB),NOSPLIT,$0-4
 	RET
 
 TEXT runtime·prefetchnta(SB),NOSPLIT,$0-4
+	RET
+
+// x -> x/1000000, x%1000000, called from Go with args, results on stack.
+TEXT runtime·usplit(SB),NOSPLIT,$0-12
+	MOVW	x+0(FP), R0
+	CALL	runtime·usplitR0(SB)
+	MOVW	R0, q+4(FP)
+	MOVW	R1, r+8(FP)
+	RET
+
+// R0, R1 = R0/1000000, R0%1000000
+TEXT runtime·usplitR0(SB),NOSPLIT,$0
+	// magic multiply to avoid software divide without available m.
+	// see output of go tool compile -S for x/1000000.
+	MOVW	R0, R3
+	MOVW	$1125899907, R1
+	MULLU	R1, R0, (R0, R1)
+	MOVW	R0>>18, R0
+	MOVW	$1000000, R1
+	MULU	R0, R1
+	SUB	R1, R3, R1
+	RET
+
+TEXT runtime·sigreturn(SB),NOSPLIT,$0-4
+        RET
+
+#ifndef GOOS_nacl
+// This is called from .init_array and follows the platform, not Go, ABI.
+TEXT runtime·addmoduledata(SB),NOSPLIT,$0-4
+	MOVW	R9, saver9-4(SP) // The access to global variables below implicitly uses R9, which is callee-save
+	MOVW	runtime·lastmoduledatap(SB), R1
+	MOVW	R0, moduledata_next(R1)
+	MOVW	R0, runtime·lastmoduledatap(SB)
+	MOVW	saver9-4(SP), R9
+	RET
+#endif
+
+TEXT ·checkASM(SB),NOSPLIT,$0-1
+	MOVW	$1, R3
+	MOVB	R3, ret+0(FP)
 	RET

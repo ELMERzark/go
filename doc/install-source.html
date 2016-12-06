@@ -71,6 +71,12 @@ architectures.
 <dd>
 	Supports Linux binaries. New in 1.5 and not as well excercised as other ports.
 </dd>
+<dt>
+	<code>mips64, mips64le</code> (64-bit MIPS big- and little-endian)
+</dt>
+<dd>
+	Supports Linux binaries. New in 1.6 and not as well excercised as other ports.
+</dd>
 </dl>
 
 <p>
@@ -112,7 +118,7 @@ location).
 
 <p>
 If you want to install Go 1.5 on a system that is not supported by Go 1.4 (such
-as <code>linux/ppc64</code>) you can either use
+as <code>linux/ppc64</code> and <code>linux/mips64le</code>) you can either use
 <a href="/src/bootstrap.bash">bootstrap.bash</a> on a system that can bootstrap Go
 1.5 normally, or bootstrap with gccgo 5.
 </p>
@@ -167,7 +173,7 @@ Then clone the repository and check out the latest release tag:</p>
 <pre>
 $ git clone https://go.googlesource.com/go
 $ cd go
-$ git checkout go1.4
+$ git checkout go1.5.1
 </pre>
 
 <h2 id="head">(Optional) Switch to the master branch</h2>
@@ -346,7 +352,7 @@ New releases are announced on the
 <a href="//groups.google.com/group/golang-announce">golang-announce</a>
 mailing list.
 Each announcement mentions the latest release tag, for instance,
-<code>go1.4</code>.
+<code>go1.5.1</code>.
 </p>
 
 <p>
@@ -399,13 +405,14 @@ These default to the values of <code>$GOHOSTOS</code> and
 
 <p>
 Choices for <code>$GOOS</code> are
-<code>darwin</code> (Mac OS X 10.6 and above and iOS), <code>dragonfly</code>, <code>freebsd</code>,
+<code>darwin</code> (Mac OS X 10.7 and above and iOS), <code>dragonfly</code>, <code>freebsd</code>,
 <code>linux</code>, <code>netbsd</code>, <code>openbsd</code>,
 <code>plan9</code>, <code>solaris</code> and <code>windows</code>.
 Choices for <code>$GOARCH</code> are
 <code>amd64</code> (64-bit x86, the most mature port),
 <code>386</code> (32-bit x86), <code>arm</code> (32-bit ARM), <code>arm64</code> (64-bit ARM),
-<code>ppc64le</code> (PowerPC 64-bit, little-endian), and <code>ppc64</code> (PowerPC 64-bit, big-endian).
+<code>ppc64le</code> (PowerPC 64-bit, little-endian), <code>ppc64</code> (PowerPC 64-bit, big-endian),
+<code>mips64le</code> (MIPS 64-bit, little-endian), and <code>mips64</code> (MIPS 64-bit, big-endian).
 The valid combinations of <code>$GOOS</code> and <code>$GOARCH</code> are:
 <table cellpadding="0">
 <tr>
@@ -454,6 +461,12 @@ The valid combinations of <code>$GOOS</code> and <code>$GOARCH</code> are:
 <td></td><td><code>linux</code></td> <td><code>ppc64le</code></td>
 </tr>
 <tr>
+<td></td><td><code>linux</code></td> <td><code>mips64</code></td>
+</tr>
+<tr>
+<td></td><td><code>linux</code></td> <td><code>mips64le</code></td>
+</tr>
+<tr>
 <td></td><td><code>netbsd</code></td> <td><code>386</code></td>
 </tr>
 <tr>
@@ -487,6 +500,7 @@ The valid combinations of <code>$GOOS</code> and <code>$GOARCH</code> are:
 <td></td><td><code>windows</code></td> <td><code>amd64</code></td>
 </tr>
 </table>
+<br>
 
 <li><code>$GOHOSTOS</code> and <code>$GOHOSTARCH</code>
 <p>

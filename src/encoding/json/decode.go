@@ -48,9 +48,16 @@ import (
 //	map[string]interface{}, for JSON objects
 //	nil for JSON null
 //
+// To unmarshal a JSON array into a slice, Unmarshal resets the slice to nil
+// and then appends each element to the slice.
+//
+// To unmarshal a JSON object into a map, Unmarshal replaces the map
+// with an empty map and then adds key-value pairs from the object to
+// the map.
+//
 // If a JSON value is not appropriate for a given target type,
 // or if a JSON number overflows the target type, Unmarshal
-// skips that field and completes the unmarshalling as best it can.
+// skips that field and completes the unmarshaling as best it can.
 // If no more serious errors are encountered, Unmarshal returns
 // an UnmarshalTypeError describing the earliest such error.
 //
@@ -167,6 +174,124 @@ func (n Number) Int64() (int64, error) {
 	return strconv.ParseInt(string(n), 10, 64)
 }
 
+// IsValid returns if the number is a valid JSON number literal.
+func (n Number) IsValid() bool {
+	// This function implements the JSON numbers grammar.
+	// See https://tools.ietf.org/html/rfc7159#section-6
+	// and http://json.org/number.gif
+
+	l := len(n)
+	if l == 0 {
+		return false
+	}
+
+	i := 0
+	c := n[i]
+	i++
+
+	// Optional -
+	if c == '-' {
+		if i == l {
+			return false
+		}
+
+		c = n[i]
+		i++
+	}
+
+	// 1-9
+	if c >= '1' && c <= '9' {
+		// Eat digits.
+		for ; i < l; i++ {
+			c = n[i]
+			if c < '0' || c > '9' {
+				break
+			}
+		}
+		i++
+	} else if c != '0' {
+		// If it's not 0 or 1-9 it's invalid.
+		return false
+	} else {
+		if i == l {
+			// Just 0
+			return true
+		}
+
+		// Skip the 0
+		c = n[i]
+		i++
+	}
+
+	// . followed by 1 or more digits.
+	if c == '.' {
+		if i == l {
+			// Just 1. is invalid.
+			return false
+		}
+
+		// . needs to be followed by at least one digit.
+		c = n[i]
+		i++
+		if c < '0' || c > '9' {
+			return false
+		}
+
+		// Eat digits.
+		for ; i < l; i++ {
+			c = n[i]
+			if c < '0' || c > '9' {
+				break
+			}
+		}
+		i++
+	}
+
+	// e or E followed by an optional - or + and
+	// 1 or more digits.
+	if c == 'e' || c == 'E' {
+		if i == l {
+			// Just 1e is invalid.
+			return false
+		}
+
+		c = n[i]
+		i++
+
+		// Optional - or +
+		if c == '-' || c == '+' {
+			if i == l {
+				// Just 1e+ is invalid.
+				return false
+			}
+
+			c = n[i]
+			i++
+		}
+
+		// Need to have a digit.
+		if c < '0' || c > '9' {
+			return false
+		}
+
+		// Eat digits.
+		for ; i < l; i++ {
+			c = n[i]
+			if c < '0' || c > '9' {
+				break
+			}
+		}
+		i++
+	}
+
+	// Make sure we are at the end.
+	if i <= l {
+		return false
+	}
+
+	return true
+}
+
 // decodeState represents the state while decoding a JSON value.
 type decodeState struct {
 	data       []byte
@@ -234,7 +359,7 @@ func (d *decodeState) scanWhile(op int) int {
 			newOp = d.scan.eof()
 			d.off = len(d.data) + 1 // mark processed EOF with len+1
 		} else {
-			c := int(d.data[d.off])
+			c := d.data[d.off]
 			d.off++
 			newOp = d.scan.step(&d.scan, c)
 		}
@@ -682,6 +807,7 @@ func (d *decodeState) literalStore(item []byte, v reflect.Value, fromQuoted bool
 			} else {
 				d.saveError(&UnmarshalTypeError{"string", v.Type(), int64(d.off)})
 			}
+			return
 		}
 		s, ok := unquoteBytes(item)
 		if !ok {
@@ -749,7 +875,7 @@ func (d *decodeState) literalStore(item []byte, v reflect.Value, fromQuoted bool
 				d.saveError(err)
 				break
 			}
-			v.Set(reflect.ValueOf(b[0:n]))
+			v.SetBytes(b[:n])
 		case reflect.String:
 			v.SetString(string(s))
 		case reflect.Interface:
@@ -773,6 +899,9 @@ func (d *decodeState) literalStore(item []byte, v reflect.Value, fromQuoted bool
 		default:
 			if v.Kind() == reflect.String && v.Type() == numberType {
 				v.SetString(s)
+				if !Number(s).IsValid() {
+					d.error(fmt.Errorf("json: invalid number literal, trying to unmarshal %q into Number", item))
+				}
 				break
 			}
 			if fromQuoted {
